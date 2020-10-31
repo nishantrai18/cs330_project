@@ -11,7 +11,7 @@ import random
 import numpy as np
 import torch
 import learn2learn as l2l
-
+from tasksets import get_tasksets
 from torch import nn, optim
 
 
@@ -22,7 +22,7 @@ def accuracy(predictions, targets):
 
 
 def fast_adapt(batch, learner, loss, adaptation_steps, shots, ways, device):
-    data, labels = batch
+    data, labels = batch # add an extra column to the data if it is weakly supervised, could take a certain percent of every batch 
     data, labels = data.to(device), labels.to(device)
 
     # Separate data into adaptation/evalutation sets
@@ -67,7 +67,16 @@ def main(
         device = torch.device('cuda')
 
     # Load train/validation/test tasksets using the benchmark interface
-    tasksets = l2l.vision.benchmarks.get_tasksets('omniglot',
+    #tasksets = l2l.vision.benchmarks.get_tasksets('omniglot',
+    #                                              train_ways=ways,
+    #                                              train_samples=2*shots,
+    #                                              test_ways=ways,
+    #                                              test_samples=2*shots,
+    #                                              num_tasks=20000,
+    #                                              root='~/data',
+    #)
+    
+    tasksets = get_tasksets('omniglot',
                                                   train_ways=ways,
                                                   train_samples=2*shots,
                                                   test_ways=ways,
@@ -75,6 +84,8 @@ def main(
                                                   num_tasks=20000,
                                                   root='~/data',
     )
+
+
 
     # Create model
     model = l2l.vision.models.OmniglotFC(28 ** 2, ways)
