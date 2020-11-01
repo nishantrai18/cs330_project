@@ -7,6 +7,7 @@ Demonstrates how to:
     * sample tasks and split them in adaptation and evaluation sets.
 """
 
+import argparse
 import random
 import numpy as np
 import torch
@@ -125,17 +126,16 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     return valid_error, valid_accuracy
 
 
-def main(
-        ways=5,
-        shots=1,
-        meta_lr=0.003,
-        fast_lr=0.5,
-        meta_batch_size=32,
-        adaptation_steps=1,
-        num_iterations=60000,
-        cuda=True,
-        seed=42,
-):
+def main(args, cuda=True, seed=42):
+
+    ways = args.ways
+    shots = args.shots
+    meta_lr = args.meta_lr
+    fast_lr = args.fast_lr
+    meta_batch_size = args.meta_batch_size
+    adaptation_steps = args.adaptation_steps
+    num_iterations = args.num_iterations
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -151,7 +151,7 @@ def main(
         test_ways=ways,
         test_samples=2*shots,
         num_tasks=20000,
-        root='~/data',
+        root=args.dir,
     )
 
     # Create model
@@ -162,9 +162,9 @@ def main(
     opt = optim.Adam(maml.parameters(), meta_lr)
 
     # Define custom losses and processors
-    loss = custom_loss_factory(LowWeightLoss)
+    loss = custom_loss_factory(args.loss)
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
-    train_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.5)
+    train_processor = batch_processor_factory(args.labeller, ways, weak_prob=args.weak_prob)
     eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
 
     tq = tqdm(range(num_iterations), desc="Training", position=0)
@@ -240,4 +240,21 @@ def main(
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--loss', default='low', type=str, help='loss to use')
+    parser.add_argument('--labeller', default='random', type=str, help='labelling method to use')
+    parser.add_argument('--weak_prob', default=0.5, type=float, help='probability of weak samples')
+    parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
+
+    parser.add_argument('--ways', default=5)
+    parser.add_argument('--shots', default=1)
+    parser.add_argument('--meta_lr', default=0.003)
+    parser.add_argument('--fast_lr', default=0.5)
+    parser.add_argument('--meta_batch_size', default=32)
+    parser.add_argument('--adaptation_steps', default=1)
+    parser.add_argument('--num_iterations', default=60000)
+
+    args = parser.parse_args()
+
+    main(args)
