@@ -13,6 +13,12 @@ import numpy as np
 import torch
 import learn2learn as l2l
 
+
+import sklearn
+from sklearn.metrics import f1_score 
+from sklearn.metrics import precision_score 
+from sklearn.metrics import recall_score 
+
 from torch import nn, optim
 from tqdm import tqdm
 
@@ -34,7 +40,7 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         '''
         weakness = torch.rand((data.shape[0],)) < weak_prob
         correct = torch.rand((weakness.sum(),)) < correct_prob
-        labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness].shape[0],), device=labels.device)
+        labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness][~correct].shape[0],), device=labels.device)
         return data, labels, weakness
 
     def identity_generator(data, labels):
@@ -56,7 +62,7 @@ StandardLoss = "standard"
 LowWeightLoss = "low"
 
 
-def custom_loss_factory(loss_method):
+def custom_loss_factory(loss_method, weak_coefficient):
     '''
     :param loss_method: Loss approach to choose
     '''
@@ -64,7 +70,7 @@ def custom_loss_factory(loss_method):
     loss = nn.CrossEntropyLoss(reduction='sum')
 
     def low_weight_loss(prediction, labels, weakness=None):
-        weak_coefficient = 0.1
+        #weak_coefficient = 0.1
         overall_weight = 0
 
         if (weakness is None) or (weakness.sum() == 0):
@@ -124,6 +130,10 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     valid_error = loss(predictions, evaluation_labels)
     valid_error /= len(evaluation_data)
     valid_accuracy = accuracy(predictions, evaluation_labels)
+    #valid_f1 = sklearn.metrics.f1_score(predictions, evaluation_labels).cpu().numpy() 
+    #valid_precision = sklearn.metrics.precision_score(predictions, evaluation_labels).cpu().numpy() 
+    #valid_recall = sklearn.metrics.recall_score(predictions, evaluation_labels).cpu().numpy() 
+    #return valid_error, valid_accuracy, valid_f1, valid_precision
     return valid_error, valid_accuracy
 
 
@@ -136,7 +146,8 @@ def main(args, cuda=True, seed=42):
     meta_batch_size = args.meta_batch_size
     adaptation_steps = args.adaptation_steps
     num_iterations = args.num_iterations
-
+    weak_coefficient = args.weak_coefficient
+    
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -163,7 +174,7 @@ def main(args, cuda=True, seed=42):
     opt = optim.Adam(maml.parameters(), meta_lr)
 
     # Define custom losses and processors
-    loss = custom_loss_factory(args.loss)
+    loss = custom_loss_factory(args.loss, weak_coefficient)
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
     train_processor = batch_processor_factory(args.labeller, ways, weak_prob=args.weak_prob)
     eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
@@ -191,6 +202,9 @@ def main(args, cuda=True, seed=42):
             evaluation_error.backward()
             meta_train_error += evaluation_error.item()
             meta_train_accuracy += evaluation_accuracy.item()
+            #meta_train_f1 += evaluation_f1.item()
+            #meta_train_precision += evaluation_precision.item()
+            #meta_train_recall += evaluation_recall.item()
 
             # Compute meta-validation loss
             learner = maml.clone()
@@ -205,14 +219,23 @@ def main(args, cuda=True, seed=42):
                                                                device)
             meta_valid_error += evaluation_error.item()
             meta_valid_accuracy += evaluation_accuracy.item()
+            #meta_valid_f1 += evaluation_f1.item()
+            #meta_train_precision += evaluation_precision.item()
+            #meta_train_recall += evaluation_recall.item()
 
         # Update metrics
         tq.set_postfix({
             'iter': iteration,
             'meta-train-err': meta_train_error / meta_batch_size,
             'meta-train-acc': meta_train_accuracy / meta_batch_size,
+            #'meta-train-f1': meta_train_f1 / meta_batch_size,
+            # 'meta-train-precision': meta_train_precision / meta_batch_size,
+            # 'meta-train-recall': meta_train_recall / meta_batch_size,
             'meta-val-err': meta_valid_error / meta_batch_size,
             'meta-val-acc': meta_valid_accuracy / meta_batch_size,
+            #'meta-val-f1': meta_valid_f1 / meta_batch_size,
+            #'meta-val-precision': meta_valid_precision / meta_batch_size,
+            #'meta-val-recall': meta_valid_recall / meta_batch_size,
         })
 
         # Average the accumulated gradients and optimize
@@ -243,18 +266,19 @@ def main(args, cuda=True, seed=42):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--loss', default='low', type=str, help='loss to use')
-    parser.add_argument('--labeller', default='random', type=str, help='labelling method to use')
+    parser.add_argument('--loss', default='low', type=str, help='loss to use: low, standard')
+    parser.add_argument('--labeller', default='random', type=str, help='labelling method to use: identity, random')
     parser.add_argument('--weak_prob', default=0.5, type=float, help='probability of weak samples')
+    parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
 
     parser.add_argument('--ways', default=5)
-    parser.add_argument('--shots', default=1)
+    parser.add_argument('--shots', default=5)
     parser.add_argument('--meta_lr', default=0.003)
     parser.add_argument('--fast_lr', default=0.5)
     parser.add_argument('--meta_batch_size', default=32)
     parser.add_argument('--adaptation_steps', default=1)
-    parser.add_argument('--num_iterations', default=60000)
+    parser.add_argument('--num_iterations', type = int, default=60000)
 
     args = parser.parse_args()
 
