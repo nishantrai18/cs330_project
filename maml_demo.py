@@ -21,7 +21,7 @@ RandomLabeller = "random"
 IdentityLabeller = "identity"
 
 
-def batch_processor_factory(labelling_method, ways, weak_prob):
+def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5):
     '''
     :param labelling_method: Which labelling method to use
     :param weak_prob: Probability of generating weak label
@@ -33,7 +33,8 @@ def batch_processor_factory(labelling_method, ways, weak_prob):
         Returns data, labels, is_weakly_labelled
         '''
         weakness = torch.rand((data.shape[0],)) < weak_prob
-        labels[weakness] = torch.randint(0, ways, (labels[weakness].shape[0],), device=labels.device)
+        correct = torch.rand((weakness.sum(),)) < correct_prob
+        labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness].shape[0],), device=labels.device)
         return data, labels, weakness
 
     def identity_generator(data, labels):
