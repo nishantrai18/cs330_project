@@ -70,15 +70,14 @@ def custom_loss_factory(loss_method, weak_coefficient):
     loss = nn.CrossEntropyLoss(reduction='sum')
 
     def low_weight_loss(prediction, labels, weakness=None):
-        #weak_coefficient = 0.1
         overall_weight = 0
 
         if (weakness is None) or (weakness.sum() == 0):
             weak_loss = 0
-            confident_loss = standard_loss(prediction, labels)
+            confident_loss = loss(prediction, labels)
             overall_weight = labels.shape[0]
         elif (~weakness).sum() == 0:
-            weak_loss = standard_loss(prediction, labels)
+            weak_loss = loss(prediction, labels)
             confident_loss = 0
             overall_weight = weak_coefficient * labels.shape[0]
         else:
@@ -86,7 +85,7 @@ def custom_loss_factory(loss_method, weak_coefficient):
             confident_loss = loss(prediction[~weakness], labels[~weakness])
             overall_weight = ((weak_coefficient * weakness.sum()) + (~weakness).sum())
 
-        return (weak_coefficient * weak_loss) + confident_loss / overall_weight
+        return ((weak_coefficient * weak_loss) + confident_loss) / overall_weight
 
     def standard_loss(prediction, labels, weakness=None):
         return loss(prediction, labels) / labels.shape[0]
@@ -176,7 +175,7 @@ def main(args, cuda=True, seed=42):
     # Define custom losses and processors
     loss = custom_loss_factory(args.loss, weak_coefficient)
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
-    train_processor = batch_processor_factory(args.labeller, ways, weak_prob=args.weak_prob)
+    train_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
     eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
 
     tq = tqdm(range(num_iterations), desc="Training", position=0)
@@ -270,6 +269,7 @@ if __name__ == '__main__':
     parser.add_argument('--labeller', default='random', type=str, help='labelling method to use: identity, random')
     parser.add_argument('--weak_prob', default=0.5, type=float, help='probability of weak samples')
     parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
+    parser.add_argument('--correct_prob', default=0.5, type=float, help='Probability of correctness in weak samples')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
 
     parser.add_argument('--ways', default=5)
