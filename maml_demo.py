@@ -177,6 +177,8 @@ def main(args, cuda=True, seed=42):
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
     train_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
     eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
+    # NOTE: Use the one below if we want to have weak samples in the test set as well
+    # eval_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
 
     tq = tqdm(range(num_iterations), desc="Training", position=0)
 
