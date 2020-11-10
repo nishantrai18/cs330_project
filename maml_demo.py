@@ -146,6 +146,7 @@ def main(args, cuda=True, seed=42):
     adaptation_steps = args.adaptation_steps
     num_iterations = args.num_iterations
     weak_coefficient = args.weak_coefficient
+    test_set_weakness = args.test_set_weakness
     
     random.seed(seed)
     np.random.seed(seed)
@@ -179,9 +180,12 @@ def main(args, cuda=True, seed=42):
     loss = custom_loss_factory(args.loss, weak_coefficient)
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
     train_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
-    eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
+    
+    if test_set_weakness:
+        eval_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
     # NOTE: Use the one below if we want to have weak samples in the test set as well
-    # eval_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
+    else:
+        eval_processor = batch_processor_factory(IdentityLabeller, ways, weak_prob=0.0)
 
     tq = tqdm(range(num_iterations), desc="Training", position=0)
 
@@ -277,6 +281,7 @@ if __name__ == '__main__':
     parser.add_argument('--correct_prob', default=0.5, type=float, help='Probability of correctness in weak samples')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
     parser.add_argument('--dataset', default='omniglot', type=str, help='dataset to use')
+    parser.add_argument('--test_set_weakness', default=True, type=bool, help='Makes test set with weak labels in its')
 
     parser.add_argument('--ways', default=5)
     parser.add_argument('--shots', default=5)
