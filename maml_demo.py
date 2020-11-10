@@ -156,7 +156,7 @@ def main(args, cuda=True, seed=42):
         device = torch.device('cuda')
 
     tasksets = l2l.vision.benchmarks.get_tasksets(
-        'omniglot',
+        args.dataset,
         train_ways=ways,
         train_samples=2*shots,
         test_ways=ways,
@@ -166,7 +166,10 @@ def main(args, cuda=True, seed=42):
     )
 
     # Create model
-    model = l2l.vision.models.OmniglotFC(28 ** 2, ways)
+    if args.dataset == 'omniglot':
+        model = l2l.vision.models.OmniglotFC(28 ** 2, ways)
+    elif args.dataset == 'mini-imagenet':
+        model = l2l.vision.models.MiniImagenetCNN(ways)
     model.to(device)
 
     maml = l2l.algorithms.MAML(model, lr=fast_lr, first_order=False)
@@ -273,6 +276,7 @@ if __name__ == '__main__':
     parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
     parser.add_argument('--correct_prob', default=0.5, type=float, help='Probability of correctness in weak samples')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
+    parser.add_argument('--dataset', default='omniglot', type=str, help='dataset to use')
 
     parser.add_argument('--ways', default=5)
     parser.add_argument('--shots', default=5)
