@@ -65,18 +65,21 @@ LowWeightLoss = "low"
 ProtoLabelLoss = "proto"
 
 
-def custom_loss_factory(loss_method, weak_coefficient):
+def custom_loss_factory(loss_method, ways, weak_coefficient):
     '''
     :param loss_method: Loss approach to choose
     '''
 
     loss = nn.CrossEntropyLoss(reduction='sum')
 
-    def low_weight_loss(prediction, labels, weakness=None):
-        stats = {}
+    def categorical_cross_entropy(y_pred, y_true):
+        y_pred = torch.clamp(y_pred, 1e-9, 1 - 1e-9)
+        return -(y_true * torch.log(y_pred)).sum(dim=1).sum()
 
-        if weakness is None:
-            weakness = torch.empty()
+    proto_loss = categorical_cross_entropy
+
+    def low_weight_loss(prediction, labels, weakness):
+        stats = {}
 
         stats['nweak'] = weakness.sum()
         stats['nconf'] = labels.shape[0] - stats['nweak']
@@ -93,7 +96,7 @@ def custom_loss_factory(loss_method, weak_coefficient):
 
         return stats
 
-    def proto_label_loss(prediction, labels, weakness=None):
+    def proto_label_loss(prediction, labels, weakness):
         '''
         Returns the loss for confident samples
         For weak samples,
@@ -101,9 +104,6 @@ def custom_loss_factory(loss_method, weak_coefficient):
             - Then proceed to compute standard cross entropy loss between the predictions and clustering based approach
         '''
         stats = {}
-
-        if weakness is None:
-            weakness = torch.empty()
 
         stats['nweak'] = weakness.sum()
         stats['nconf'] = labels.shape[0] - stats['nweak']
@@ -118,23 +118,26 @@ def custom_loss_factory(loss_method, weak_coefficient):
             weak_labels = labels[weakness]
             # Potential experiment: Add weak label vs not adding it here; results will change as we change the
             # correct ratio in the weak labels
-            clustered_labels = compute_protonet_like_labels(
-                prediction[~weakness], prediction[weakness], labels[~weakness])
+            clustered_label_probs = compute_protonet_like_labels(
+                prediction[~weakness], prediction[weakness], labels[~weakness], num_classes=ways)
             # Compute loss
-            stats['lweak'] = loss(prediction[weakness], clustered_labels)
+            stats['lweak'] = proto_loss(prediction[weakness], clustered_label_probs)
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
 
         return stats
 
-    def standard_loss(prediction, labels, weakness=None):
+    def standard_loss(prediction, labels, weakness):
         # Modify the global weak weight as standard is just low_weight with coeff 1
         global weak_coefficient
         weak_coefficient = 1.0
-        return low_weight_loss(prediction, labels)
+        return low_weight_loss(prediction, labels, weakness)
 
     def loss_wrapper(loss_fn):
 
         def wrapper(prediction, labels, weakness=None):
+            if weakness is None:
+                weakness = torch.zeros(labels.shape[0])
+
             stats = loss_fn(prediction, labels, weakness)
             overall_weight = (stats['nconf']) + (stats['nweak'] * weak_coefficient)
             overall_loss = (stats['lconf']) + (stats['lweak'] * weak_coefficient)
@@ -186,8 +189,8 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
 
     # Evaluate the adapted model
     predictions = learner(evaluation_data)
-    valid_error = loss(predictions, evaluation_labels)
-    valid_error /= len(evaluation_data)
+    valid_stats = loss(predictions, evaluation_labels)
+    valid_error = valid_stats['overall_loss']
     valid_accuracy = accuracy(predictions, evaluation_labels)
     #valid_f1 = sklearn.metrics.f1_score(predictions, evaluation_labels).cpu().numpy() 
     #valid_precision = sklearn.metrics.precision_score(predictions, evaluation_labels).cpu().numpy() 
@@ -215,30 +218,33 @@ def pairwise_distance(A, B):
     return D
 
 
-def get_prototypes_from_labels(samples, onehot_labels):
+def get_prototypes_from_labels(samples, labels):
     '''
     Returns a N x D matrix where ith row represents ith class
     '''
     N = samples.shape[0]
-    labels = onehot_labels.argmax(dim=1)
     M = torch.zeros(labels.max() + 1, N)
     M[labels, torch.arange(N)] = 1
-    M = torch.nn.functional.normalize(M, p=1, dim=1)
+    M = torch.nn.functional.normalize(M, p=1, dim=1).to(samples.device)
     return torch.mm(M, samples)
 
 
-def compute_protonet_like_labels(support, q_latent, support_labels, weak_query_labels=None):
+def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None):
     """
       calculates the prototype network like proposed labels using the latent representation of x
       and the latent representation of the queries
       Args:
         support: latent representation of supports with known labels with shape [S, D], where D is the latent dimension
         q_latent: latent representation of queries with shape [Q, D], where D is the latent dimension
-        support_labels: one-hot encodings of the labels of the supports with shape [S, N]
+        support_labels: Labels of the supports with shape [S]
         weak_query_labels: Weak labels for the query, optional
       Returns:
         proposed_labels: predicted labels for the queries
     """
+
+    assert torch.unique(support_labels).shape[0] == num_classes, "Invalid num classes: {}".format(
+        torch.unique(support_labels)
+    )
 
     prototypes = get_prototypes_from_labels(support, support_labels)
     distance = pairwise_distance(q_latent, prototypes)
@@ -252,7 +258,8 @@ def compute_protonet_like_labels(support, q_latent, support_labels, weak_query_l
     if weak_query_labels is not None:
         # Another hyper-parameter to tune, MIGHT be able to learn this as well
         balance = 0.5
-        probabilities = ((probabilities * balance) + (weak_query_labels * (1 - balance)))
+        weak_query_probs = torch.eye(support_labels.max() + 1)[weak_query_labels]
+        probabilities = ((probabilities * balance) + (weak_query_probs * (1 - balance)))
 
     return probabilities
 
@@ -306,7 +313,7 @@ def main(args, cuda=True, seed=42):
     opt = optim.Adam(maml.parameters(), meta_lr)
 
     # Define custom losses and processors
-    loss = custom_loss_factory(args.loss, weak_coefficient)
+    loss = custom_loss_factory(args.loss, args.ways, weak_coefficient)
     # We need dedicated train and eval processors, because we don't perform weak label generation during eval
     train_processor = batch_processor_factory(args.labeller, ways, args.weak_prob, args.correct_prob)
     
@@ -410,14 +417,14 @@ def main(args, cuda=True, seed=42):
 def run_unittests():
     A = torch.tensor([[0, 1, 0], [1, 0, 1]]).float()
     B = torch.tensor([[1, 1, 0], [0, 1, 1]]).float()
-    labelsA = torch.tensor([[1, 0], [0, 1]])
-    labelsB = torch.tensor([[0, 1], [1, 0]])
+    labelsA = torch.tensor([[0, 1]])
+    labelsB = torch.tensor([[1, 0]])
 
     print(pairwise_distance(A, A))
     print(pairwise_distance(A, B))
     print(pairwise_distance(B, A))
-    print(compute_protonet_like_labels(A, B, labelsA, weak_query_labels=None))
-    print(compute_protonet_like_labels(A, B, labelsA, weak_query_labels=labelsB))
+    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=None))
+    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=labelsB))
 
 
 def str2bool(s):
@@ -443,8 +450,8 @@ if __name__ == '__main__':
     parser.add_argument('--loss', default='low', type=str, help='Which approach to use: standard, low, proto')
     parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
 
-    parser.add_argument('--ways', default=5)
-    parser.add_argument('--shots', default=5)
+    parser.add_argument('--ways', default=5, type=int)
+    parser.add_argument('--shots', default=5, type=int)
     parser.add_argument('--meta_lr', default=0.003)
     parser.add_argument('--fast_lr', default=0.5)
     parser.add_argument('--meta_batch_size', default=32)
