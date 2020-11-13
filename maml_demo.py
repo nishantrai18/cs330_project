@@ -136,6 +136,77 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     return valid_error, valid_accuracy
 
 
+def pairwise_distance(A, B):
+    # squared norms of each row in A and B
+    na = torch.sum(A * A, dim=1)
+    nb = torch.sum(B * B, dim=1)
+
+    # na as a row and nb as a column vectors
+    na = na.reshape([-1, 1])
+    nb = nb.reshape([1, -1])
+
+    # return pairwise euclidean difference matrix
+    D = torch.sqrt(torch.clamp(na - 2 * A.matmul(B.transpose(1, 0)) + nb, min=0.0))
+
+    return D
+
+
+def get_prototypes_from_labels(samples, onehot_labels):
+    '''
+    Returns a N x D matrix where ith row represents ith class
+    '''
+    N = samples.shape[0]
+    labels = onehot_labels.argmax(dim=1)
+    M = torch.zeros(labels.max() + 1, N)
+    M[labels, torch.arange(N)] = 1
+    M = torch.nn.functional.normalize(M, p=1, dim=1)
+    return torch.mm(M, samples)
+
+
+def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None):
+    """
+      calculates the prototype network like proposed labels using the latent representation of x
+      and the latent representation of the queries
+      Args:
+        support: latent representation of supports with known labels with shape [S, D], where D is the latent dimension
+        q_latent: latent representation of queries with shape [Q, D], where D is the latent dimension
+        support_labels: one-hot encodings of the labels of the supports with shape [S, N]
+        num_classes: number of classes (N) for classification
+        weak_query_labels: Weak labels for the query, optional
+      Returns:
+        proposed_labels: predicted labels for the queries
+    """
+
+    assert support_labels.shape[1] == num_classes, "Invalid max label shape num: {}".format(support_labels.shape)
+
+    prototypes = get_prototypes_from_labels(support, support_labels)
+    distance = pairwise_distance(q_latent, prototypes)
+
+    # Another hyperparameter which can be tuned, makes the label smoother and allows for more room for mistakes in
+    # the proposal
+    temperature = 1.0
+    logits = -distance
+    probabilities = torch.nn.functional.softmax(logits / temperature, dim=1)
+
+    if weak_query_labels is not None:
+        balance = 0.5
+        probabilities = ((probabilities * balance) + (weak_query_labels * (1 - balance)))
+
+    return probabilities
+
+
+def get_model_for_dataset(args):
+    # Create model
+    model = None
+    if args.dataset == 'omniglot':
+        model = l2l.vision.models.OmniglotFC(28 ** 2, args.ways)
+    elif args.dataset == 'mini-imagenet':
+        model = l2l.vision.models.MiniImagenetCNN(args.ways)
+    model.to(args.device)
+
+    return model
+
+
 def main(args, cuda=True, seed=42):
 
     ways = args.ways
@@ -155,6 +226,7 @@ def main(args, cuda=True, seed=42):
     if cuda:
         torch.cuda.manual_seed(seed)
         device = torch.device('cuda')
+    args.device = device
 
     tasksets = l2l.vision.benchmarks.get_tasksets(
         args.dataset,
@@ -166,12 +238,7 @@ def main(args, cuda=True, seed=42):
         root=args.dir,
     )
 
-    # Create model
-    if args.dataset == 'omniglot':
-        model = l2l.vision.models.OmniglotFC(28 ** 2, ways)
-    elif args.dataset == 'mini-imagenet':
-        model = l2l.vision.models.MiniImagenetCNN(ways)
-    model.to(device)
+    model = get_model_for_dataset(args)
 
     maml = l2l.algorithms.MAML(model, lr=fast_lr, first_order=False)
     opt = optim.Adam(maml.parameters(), meta_lr)
@@ -271,8 +338,30 @@ def main(args, cuda=True, seed=42):
     print('Meta Test Accuracy', meta_test_accuracy / meta_batch_size)
 
 
+def run_unittests():
+    A = torch.tensor([[0, 1, 0], [1, 0, 1]]).float()
+    B = torch.tensor([[1, 1, 0], [0, 1, 1]]).float()
+    labelsA = torch.tensor([[1, 0], [0, 1]])
+    labelsB = torch.tensor([[0, 1], [1, 0]])
+
+    print(pairwise_distance(A, A))
+    print(pairwise_distance(A, B))
+    print(pairwise_distance(B, A))
+    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=None))
+    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=labelsB))
+
+
+def str2bool(s):
+    """Convert string to bool (in argparse context)."""
+    if s.lower() not in ['true', 'false']:
+        raise ValueError('Need bool; got %r' % s)
+    return {'true': True, 'false': False}[s.lower()]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+
+    parser.add_argument('--unittest', default=False, type=str2bool, help='override and run unittest')
 
     parser.add_argument('--loss', default='low', type=str, help='loss to use: low, standard')
     parser.add_argument('--labeller', default='random', type=str, help='labelling method to use: identity, random')
@@ -287,10 +376,13 @@ if __name__ == '__main__':
     parser.add_argument('--shots', default=5)
     parser.add_argument('--meta_lr', default=0.003)
     parser.add_argument('--fast_lr', default=0.5)
-    parser.add_argument('--meta_batch_size', default=32)
+    parser.add_argument('--meta_batch_size', default=256)
     parser.add_argument('--adaptation_steps', default=1)
-    parser.add_argument('--num_iterations', type = int, default=60000)
+    parser.add_argument('--num_iterations', type=int, default=60000)
 
     args = parser.parse_args()
 
-    main(args)
+    if args.unittest:
+        run_unittests()
+    else:
+        main(args)
