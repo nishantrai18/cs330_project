@@ -38,6 +38,8 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         '''
         Returns data, labels, is_weakly_labelled
         '''
+        # TODO: Ensure that we have at least one correct sample for each class
+        # TODO: Remove randomness from here, let's have fixed ratios instead, makes the code simpler
         weakness = torch.rand((data.shape[0],)) < weak_prob
         correct = torch.rand((weakness.sum(),)) < correct_prob
         labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness][~correct].shape[0],), device=labels.device)
@@ -60,6 +62,7 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
 
 StandardLoss = "standard"
 LowWeightLoss = "low"
+ProtoLabelLoss = "proto"
 
 
 def custom_loss_factory(loss_method, weak_coefficient):
@@ -70,32 +73,89 @@ def custom_loss_factory(loss_method, weak_coefficient):
     loss = nn.CrossEntropyLoss(reduction='sum')
 
     def low_weight_loss(prediction, labels, weakness=None):
-        overall_weight = 0
+        stats = {}
 
-        if (weakness is None) or (weakness.sum() == 0):
-            weak_loss = 0
-            confident_loss = loss(prediction, labels)
-            overall_weight = labels.shape[0]
-        elif (~weakness).sum() == 0:
-            weak_loss = loss(prediction, labels)
-            confident_loss = 0
-            overall_weight = weak_coefficient * labels.shape[0]
+        if weakness is None:
+            weakness = torch.empty()
+
+        stats['nweak'] = weakness.sum()
+        stats['nconf'] = labels.shape[0] - stats['nweak']
+
+        if stats['nweak'] == 0:
+            stats['lweak'] = 0
+            stats['lconf'] = loss(prediction, labels)
+        elif stats['nconf'] == 0:
+            stats['lweak'] = loss(prediction, labels)
+            stats['lconf'] = 0
         else:
-            weak_loss = loss(prediction[weakness], labels[weakness])
-            confident_loss = loss(prediction[~weakness], labels[~weakness])
-            overall_weight = ((weak_coefficient * weakness.sum()) + (~weakness).sum())
+            stats['lweak'] = loss(prediction[weakness], labels[weakness])
+            stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
 
-        return ((weak_coefficient * weak_loss) + confident_loss) / overall_weight
+        return stats
+
+    def proto_label_loss(prediction, labels, weakness=None):
+        '''
+        Returns the loss for confident samples
+        For weak samples,
+            - First compute predictions based on clustering
+            - Then proceed to compute standard cross entropy loss between the predictions and clustering based approach
+        '''
+        stats = {}
+
+        if weakness is None:
+            weakness = torch.empty()
+
+        stats['nweak'] = weakness.sum()
+        stats['nconf'] = labels.shape[0] - stats['nweak']
+
+        if stats['nweak'] == 0:
+            stats['lweak'] = 0
+            stats['lconf'] = loss(prediction, labels)
+        elif stats['nconf'] == 0:
+            stats['lweak'] = loss(prediction, labels)
+            stats['lconf'] = 0
+        else:
+            weak_labels = labels[weakness]
+            # Potential experiment: Add weak label vs not adding it here; results will change as we change the
+            # correct ratio in the weak labels
+            clustered_labels = compute_protonet_like_labels(
+                prediction[~weakness], prediction[weakness], labels[~weakness])
+            # Compute loss
+            stats['lweak'] = loss(prediction[weakness], clustered_labels)
+            stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
+
+        return stats
 
     def standard_loss(prediction, labels, weakness=None):
-        return loss(prediction, labels) / labels.shape[0]
+        # Modify the global weak weight as standard is just low_weight with coeff 1
+        global weak_coefficient
+        weak_coefficient = 1.0
+        return low_weight_loss(prediction, labels)
 
-    if loss_method == StandardLoss:
-        return standard_loss
-    elif loss_method == LowWeightLoss:
-        return low_weight_loss
-    else:
-        assert False, "Invalid type of loss method: {}".format(loss_method)
+    def loss_wrapper(loss_fn):
+
+        def wrapper(prediction, labels, weakness=None):
+            stats = loss_fn(prediction, labels, weakness)
+            overall_weight = (stats['nconf']) + (stats['nweak'] * weak_coefficient)
+            overall_loss = (stats['lconf']) + (stats['lweak'] * weak_coefficient)
+            stats['avg_lconf'] = stats['lconf'] / stats['nconf']
+            stats['avg_lweak'] = stats['lweak'] / stats['nweak']
+            stats['overall_loss'] = overall_loss / overall_weight
+            return stats
+
+        return wrapper
+
+    def get_loss_method():
+        if loss_method == StandardLoss:
+            return standard_loss
+        elif loss_method == LowWeightLoss:
+            return low_weight_loss
+        elif loss_method == ProtoLabelLoss:
+            return proto_label_loss
+        else:
+            assert False, "Invalid type of loss method: {}".format(loss_method)
+
+    return loss_wrapper(get_loss_method())
 
 
 def accuracy(predictions, targets):
@@ -118,11 +178,11 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     # Transform the adaptation data to become weak
     adaptation_data, adaptation_labels, adaptation_weakness = batch_processor(adaptation_data, adaptation_labels)
 
+    stats = {}
     # Adapt the model
     for step in range(adaptation_steps):
-        train_error = loss(learner(adaptation_data), adaptation_labels, adaptation_weakness)
-        train_error /= len(adaptation_data)
-        learner.adapt(train_error)
+        stats = loss(learner(adaptation_data), adaptation_labels, adaptation_weakness)
+        learner.adapt(stats['overall_loss'])
 
     # Evaluate the adapted model
     predictions = learner(evaluation_data)
@@ -133,7 +193,11 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     #valid_precision = sklearn.metrics.precision_score(predictions, evaluation_labels).cpu().numpy() 
     #valid_recall = sklearn.metrics.recall_score(predictions, evaluation_labels).cpu().numpy() 
     #return valid_error, valid_accuracy, valid_f1, valid_precision
-    return valid_error, valid_accuracy
+
+    # process stats to be detached cpu floats
+    stats = {k: v.cpu().detach().item() for k, v in stats.items()}
+
+    return valid_error, valid_accuracy, stats
 
 
 def pairwise_distance(A, B):
@@ -163,7 +227,7 @@ def get_prototypes_from_labels(samples, onehot_labels):
     return torch.mm(M, samples)
 
 
-def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None):
+def compute_protonet_like_labels(support, q_latent, support_labels, weak_query_labels=None):
     """
       calculates the prototype network like proposed labels using the latent representation of x
       and the latent representation of the queries
@@ -171,13 +235,10 @@ def compute_protonet_like_labels(support, q_latent, support_labels, num_classes,
         support: latent representation of supports with known labels with shape [S, D], where D is the latent dimension
         q_latent: latent representation of queries with shape [Q, D], where D is the latent dimension
         support_labels: one-hot encodings of the labels of the supports with shape [S, N]
-        num_classes: number of classes (N) for classification
         weak_query_labels: Weak labels for the query, optional
       Returns:
         proposed_labels: predicted labels for the queries
     """
-
-    assert support_labels.shape[1] == num_classes, "Invalid max label shape num: {}".format(support_labels.shape)
 
     prototypes = get_prototypes_from_labels(support, support_labels)
     distance = pairwise_distance(q_latent, prototypes)
@@ -189,6 +250,7 @@ def compute_protonet_like_labels(support, q_latent, support_labels, num_classes,
     probabilities = torch.nn.functional.softmax(logits / temperature, dim=1)
 
     if weak_query_labels is not None:
+        # Another hyper-parameter to tune, MIGHT be able to learn this as well
         balance = 0.5
         probabilities = ((probabilities * balance) + (weak_query_labels * (1 - balance)))
 
@@ -266,7 +328,7 @@ def main(args, cuda=True, seed=42):
             # Compute meta-training loss
             learner = maml.clone()
             batch = tasksets.train.sample()
-            evaluation_error, evaluation_accuracy = fast_adapt(batch,
+            evaluation_error, evaluation_accuracy, train_stats = fast_adapt(batch,
                                                                train_processor,
                                                                learner,
                                                                loss,
@@ -284,7 +346,7 @@ def main(args, cuda=True, seed=42):
             # Compute meta-validation loss
             learner = maml.clone()
             batch = tasksets.validation.sample()
-            evaluation_error, evaluation_accuracy = fast_adapt(batch,
+            evaluation_error, evaluation_accuracy, val_stats = fast_adapt(batch,
                                                                eval_processor,
                                                                learner,
                                                                loss,
@@ -298,16 +360,23 @@ def main(args, cuda=True, seed=42):
             #meta_train_precision += evaluation_precision.item()
             #meta_train_recall += evaluation_recall.item()
 
-        # Update metrics
+        # Update metrics, legend is here
+        # mt - meta train
+        # mv - meta val
+        # lconf - confident loss i.e. for strongly labeled data
+        # lweak - weak loss i.e. for weakly labeled data
         tq.set_postfix({
-            'iter': iteration,
-            'meta-train-err': meta_train_error / meta_batch_size,
-            'meta-train-acc': meta_train_accuracy / meta_batch_size,
+            'mt-err': meta_train_error / meta_batch_size,
+            'mt-acc': meta_train_accuracy / meta_batch_size,
+            'mt-lconf': train_stats['lconf'],
+            'mt-lweak': train_stats['lweak'],
             #'meta-train-f1': meta_train_f1 / meta_batch_size,
             # 'meta-train-precision': meta_train_precision / meta_batch_size,
             # 'meta-train-recall': meta_train_recall / meta_batch_size,
-            'meta-val-err': meta_valid_error / meta_batch_size,
-            'meta-val-acc': meta_valid_accuracy / meta_batch_size,
+            'mv-err': meta_valid_error / meta_batch_size,
+            'mv-acc': meta_valid_accuracy / meta_batch_size,
+            'mv-lconf': val_stats['lconf'],
+            'mv-lweak': val_stats['lweak'],
             #'meta-val-f1': meta_valid_f1 / meta_batch_size,
             #'meta-val-precision': meta_valid_precision / meta_batch_size,
             #'meta-val-recall': meta_valid_recall / meta_batch_size,
@@ -324,7 +393,7 @@ def main(args, cuda=True, seed=42):
         # Compute meta-testing loss
         learner = maml.clone()
         batch = tasksets.test.sample()
-        evaluation_error, evaluation_accuracy = fast_adapt(batch,
+        evaluation_error, evaluation_accuracy, test_stats = fast_adapt(batch,
                                                            eval_processor,
                                                            learner,
                                                            loss,
@@ -347,8 +416,8 @@ def run_unittests():
     print(pairwise_distance(A, A))
     print(pairwise_distance(A, B))
     print(pairwise_distance(B, A))
-    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=None))
-    print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=labelsB))
+    print(compute_protonet_like_labels(A, B, labelsA, weak_query_labels=None))
+    print(compute_protonet_like_labels(A, B, labelsA, weak_query_labels=labelsB))
 
 
 def str2bool(s):
@@ -363,20 +432,22 @@ if __name__ == '__main__':
 
     parser.add_argument('--unittest', default=False, type=str2bool, help='override and run unittest')
 
-    parser.add_argument('--loss', default='low', type=str, help='loss to use: low, standard')
     parser.add_argument('--labeller', default='random', type=str, help='labelling method to use: identity, random')
     parser.add_argument('--weak_prob', default=0.5, type=float, help='probability of weak samples')
-    parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
     parser.add_argument('--correct_prob', default=0.5, type=float, help='Probability of correctness in weak samples')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
     parser.add_argument('--dataset', default='omniglot', type=str, help='dataset to use')
     parser.add_argument('--test_set_weakness', default=True, type=bool, help='Makes test set with weak labels in its')
 
+    # Flags related to the approach we're using
+    parser.add_argument('--loss', default='low', type=str, help='Which approach to use: standard, low, proto')
+    parser.add_argument('--weak_coefficient', default=0.1, type=float, help='The weight of the weak samples in the loss function')
+
     parser.add_argument('--ways', default=5)
     parser.add_argument('--shots', default=5)
     parser.add_argument('--meta_lr', default=0.003)
     parser.add_argument('--fast_lr', default=0.5)
-    parser.add_argument('--meta_batch_size', default=256)
+    parser.add_argument('--meta_batch_size', default=32)
     parser.add_argument('--adaptation_steps', default=1)
     parser.add_argument('--num_iterations', type=int, default=60000)
 
