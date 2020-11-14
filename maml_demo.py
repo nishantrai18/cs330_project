@@ -40,8 +40,27 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         '''
         # TODO: Ensure that we have at least one correct sample for each class
         # TODO: Remove randomness from here, let's have fixed ratios instead, makes the code simpler
-        weakness = torch.rand((data.shape[0],)) < weak_prob
-        correct = torch.rand((weakness.sum(),)) < correct_prob
+        #weakness = torch.rand((data.shape[0],)) < weak_prob
+        weakness = ~(torch.rand((data.shape[0],)) < 1) # make a tensor of False
+        idx = torch.randperm(weakness.size(0))[:int(weakness.size(0)*weak_prob)] # this will select exactly weak_prob percent
+        weakness[idx] = True # mark which indexes will be weak
+        
+        # ENSURE THAT NO MATTER WHAT (N WAYS) EXAMPLES WILL BE TRUE - so there will be at least one correct example from each class
+        # WE FORCE THE FIRST SAMPLE IN EACH CLASS TO BE TRUE
+        label2firstidx = {}
+        i = 0
+        for lb in labels:
+            if lb.item() not in label2firstidx:
+                label2firstidx[lb.item()] = i
+            i+=1
+        idx = list(label2firstidx.values())
+        weakness[idx] = False # not weak means it is marked as correct
+        
+        #correct = torch.rand((weakness.sum(),)) < correct_prob
+        correct = ~(torch.rand((weakness.sum(),)) < 1) # make a tensor of False
+        idx = torch.randperm(correct.size(0))[:int(correct.size(0)*correct_prob)] # this will select exactly correct_prob percent to be marked as true of the weak data 
+        correct[idx] = True # mark which indexes of the weakness will be marked as correct
+      
         labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness][~correct].shape[0],), device=labels.device)
         return data, labels, weakness
 
@@ -229,7 +248,7 @@ def get_prototypes_from_labels(samples, labels):
     return torch.mm(M, samples)
 
 
-def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None):
+def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None,temperature = 1.0):
     """
       calculates the prototype network like proposed labels using the latent representation of x
       and the latent representation of the queries
@@ -251,7 +270,7 @@ def compute_protonet_like_labels(support, q_latent, support_labels, num_classes,
 
     # Another hyperparameter which can be tuned, makes the label smoother and allows for more room for mistakes in
     # the proposal
-    temperature = 1.0
+    #temperature = 1.0
     logits = -distance
     probabilities = torch.nn.functional.softmax(logits / temperature, dim=1)
 
