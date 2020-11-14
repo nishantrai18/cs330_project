@@ -82,7 +82,7 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
 StandardLoss = "standard"
 LowWeightLoss = "low"
 ProtoLabelLoss = "proto"
-
+temp = 1
 
 def custom_loss_factory(loss_method, ways, weak_coefficient):
     '''
@@ -138,7 +138,7 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
             # Potential experiment: Add weak label vs not adding it here; results will change as we change the
             # correct ratio in the weak labels
             clustered_label_probs = compute_protonet_like_labels(
-                prediction[~weakness], prediction[weakness], labels[~weakness], num_classes=ways)
+                prediction[~weakness], prediction[weakness], labels[~weakness], num_classes=ways, temperature=temp)
             # Compute loss
             stats['lweak'] = proto_loss(prediction[weakness], clustered_label_probs)
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
@@ -306,6 +306,9 @@ def main(args, cuda=True, seed=42):
     num_iterations = args.num_iterations
     weak_coefficient = args.weak_coefficient
     test_set_weakness = args.test_set_weakness
+    temperature = args.temperature
+    global temp 
+    temp = temperature
     
     random.seed(seed)
     np.random.seed(seed)
@@ -459,7 +462,7 @@ if __name__ == '__main__':
     parser.add_argument('--unittest', default=False, type=str2bool, help='override and run unittest')
 
     parser.add_argument('--labeller', default='random', type=str, help='labelling method to use: identity, random')
-    parser.add_argument('--weak_prob', default=0.5, type=float, help='probability of weak samples')
+    parser.add_argument('--weak_prob', default=0.2, type=float, help='probability of weak samples')
     parser.add_argument('--correct_prob', default=0.5, type=float, help='Probability of correctness in weak samples')
     parser.add_argument('--dir', default='~/data/', type=str, help='directory to store files')
     parser.add_argument('--dataset', default='omniglot', type=str, help='dataset to use')
@@ -476,6 +479,7 @@ if __name__ == '__main__':
     parser.add_argument('--meta_batch_size', default=32)
     parser.add_argument('--adaptation_steps', default=1)
     parser.add_argument('--num_iterations', type=int, default=60000)
+    parser.add_argument('--temperature', type=int, default=1)
 
     args = parser.parse_args()
 
