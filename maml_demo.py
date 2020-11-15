@@ -12,12 +12,13 @@ import random
 import numpy as np
 import torch
 import learn2learn as l2l
-
-
 import sklearn
-from sklearn.metrics import f1_score 
+
+from sklearn.metrics import f1_score
 from sklearn.metrics import precision_score 
 from sklearn.metrics import recall_score 
+
+from custom_models import CustomOmniglotFC, CustomMiniImagenetCNN
 
 from torch import nn, optim
 from tqdm import tqdm
@@ -60,7 +61,7 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         correct = ~(torch.rand((weakness.sum(),)) < 1) # make a tensor of False
         idx = torch.randperm(correct.size(0))[:int(correct.size(0)*correct_prob)] # this will select exactly correct_prob percent to be marked as true of the weak data 
         correct[idx] = True # mark which indexes of the weakness will be marked as correct
-      
+
         labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness][~correct].shape[0],), device=labels.device)
         return data, labels, weakness
 
@@ -97,7 +98,7 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
 
     proto_loss = categorical_cross_entropy
 
-    def low_weight_loss(prediction, labels, weakness):
+    def low_weight_loss(prediction, labels, weakness, _=None):
         stats = {}
 
         stats['nweak'] = weakness.sum()
@@ -115,7 +116,7 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
 
         return stats
 
-    def proto_label_loss(prediction, labels, weakness):
+    def proto_label_loss(prediction, labels, weakness, etc=None):
         '''
         Returns the loss for confident samples
         For weak samples,
@@ -137,15 +138,18 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
             weak_labels = labels[weakness]
             # Potential experiment: Add weak label vs not adding it here; results will change as we change the
             # correct ratio in the weak labels
+            features = etc['features']
             clustered_label_probs = compute_protonet_like_labels(
-                prediction[~weakness], prediction[weakness], labels[~weakness], num_classes=ways, temperature=temp)
+                features[~weakness], features[weakness], labels[~weakness], num_classes=ways, temperature=temp)
             # Compute loss
             stats['lweak'] = proto_loss(prediction[weakness], clustered_label_probs)
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
+            stats['wacc'] = \
+                (prediction[weakness].argmax(dim=-1) == etc['gt_labels'][weakness]).sum() * 1.0 / (labels[weakness].shape[0] * 1.0)
 
         return stats
 
-    def standard_loss(prediction, labels, weakness):
+    def standard_loss(prediction, labels, weakness, _=None):
         # Modify the global weak weight as standard is just low_weight with coeff 1
         global weak_coefficient
         weak_coefficient = 1.0
@@ -153,11 +157,11 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
 
     def loss_wrapper(loss_fn):
 
-        def wrapper(prediction, labels, weakness=None):
+        def wrapper(prediction, labels, weakness=None, etc=None):
             if weakness is None:
                 weakness = torch.zeros(labels.shape[0])
 
-            stats = loss_fn(prediction, labels, weakness)
+            stats = loss_fn(prediction, labels, weakness, etc)
             overall_weight = (stats['nconf']) + (stats['nweak'] * weak_coefficient)
             overall_loss = (stats['lconf']) + (stats['lweak'] * weak_coefficient)
             stats['avg_lconf'] = stats['lconf'] / stats['nconf']
@@ -194,20 +198,25 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     adaptation_indices[np.arange(shots*ways) * 2] = True
     evaluation_indices = torch.from_numpy(~adaptation_indices)
     adaptation_indices = torch.from_numpy(adaptation_indices)
-    adaptation_data, adaptation_labels = data[adaptation_indices], labels[adaptation_indices]
+    adaptation_data, gt_adaptation_labels = data[adaptation_indices], labels[adaptation_indices]
     evaluation_data, evaluation_labels = data[evaluation_indices], labels[evaluation_indices]
 
     # Transform the adaptation data to become weak
-    adaptation_data, adaptation_labels, adaptation_weakness = batch_processor(adaptation_data, adaptation_labels)
+    adaptation_data, adaptation_labels, adaptation_weakness = batch_processor(adaptation_data, gt_adaptation_labels)
 
     stats = {}
     # Adapt the model
     for step in range(adaptation_steps):
-        stats = loss(learner(adaptation_data), adaptation_labels, adaptation_weakness)
+        logits, features = learner(adaptation_data)
+        stats = loss(
+            logits,
+            adaptation_labels,
+            adaptation_weakness,
+            {'features': features, 'gt_labels': gt_adaptation_labels})
         learner.adapt(stats['overall_loss'])
 
     # Evaluate the adapted model
-    predictions = learner(evaluation_data)
+    predictions, _ = learner(evaluation_data)
     valid_stats = loss(predictions, evaluation_labels)
     valid_error = valid_stats['overall_loss']
     valid_accuracy = accuracy(predictions, evaluation_labels)
@@ -286,10 +295,11 @@ def compute_protonet_like_labels(support, q_latent, support_labels, num_classes,
 def get_model_for_dataset(args):
     # Create model
     model = None
+    features_to_use = args.features_to_use
     if args.dataset == 'omniglot':
-        model = l2l.vision.models.OmniglotFC(28 ** 2, args.ways)
+        model = CustomOmniglotFC(28 ** 2, args.ways, return_fets=features_to_use)
     elif args.dataset == 'mini-imagenet':
-        model = l2l.vision.models.MiniImagenetCNN(args.ways)
+        model = CustomMiniImagenetCNN(args.ways, return_fets=features_to_use)
     model.to(args.device)
 
     return model
@@ -353,6 +363,7 @@ def main(args, cuda=True, seed=42):
         meta_train_accuracy = 0.0
         meta_valid_error = 0.0
         meta_valid_accuracy = 0.0
+        proto_train_acc = 0.0
         for task in range(meta_batch_size):
             # Compute meta-training loss
             learner = maml.clone()
@@ -385,6 +396,7 @@ def main(args, cuda=True, seed=42):
                                                                device)
             meta_valid_error += evaluation_error.item()
             meta_valid_accuracy += evaluation_accuracy.item()
+            proto_train_acc += train_stats['wacc']
             #meta_valid_f1 += evaluation_f1.item()
             #meta_train_precision += evaluation_precision.item()
             #meta_train_recall += evaluation_recall.item()
@@ -399,6 +411,7 @@ def main(args, cuda=True, seed=42):
             'mt-acc': meta_train_accuracy / meta_batch_size,
             'mt-lconf': train_stats['lconf'],
             'mt-lweak': train_stats['lweak'],
+            'wacc': proto_train_acc / meta_batch_size,
             #'meta-train-f1': meta_train_f1 / meta_batch_size,
             # 'meta-train-precision': meta_train_precision / meta_batch_size,
             # 'meta-train-recall': meta_train_recall / meta_batch_size,
@@ -480,6 +493,7 @@ if __name__ == '__main__':
     parser.add_argument('--adaptation_steps', default=1)
     parser.add_argument('--num_iterations', type=int, default=60000)
     parser.add_argument('--temperature', type=int, default=1)
+    parser.add_argument('--features_to_use', default='logits', type=str, help='Choose one of input, fets')
 
     args = parser.parse_args()
 
