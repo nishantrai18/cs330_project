@@ -42,15 +42,16 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         # TODO: Ensure that we have at least one correct sample for each class
         # TODO: Remove randomness from here, let's have fixed ratios instead, makes the code simpler
         #weakness = torch.rand((data.shape[0],)) < weak_prob
-        weakness = ~(torch.rand((data.shape[0],)) < 1) # make a tensor of False
+        weakness = torch.zeros((data.shape[0],)).bool() # make a tensor of False
         idx = torch.randperm(weakness.size(0))[:int(weakness.size(0)*weak_prob)] # this will select exactly weak_prob percent
         weakness[idx] = True # mark which indexes will be weak
-        
+        new_labels = labels.clone()
+
         # ENSURE THAT NO MATTER WHAT (N WAYS) EXAMPLES WILL BE TRUE - so there will be at least one correct example from each class
         # WE FORCE THE FIRST SAMPLE IN EACH CLASS TO BE TRUE
         label2firstidx = {}
         i = 0
-        for lb in labels:
+        for lb in new_labels:
             if lb.item() not in label2firstidx:
                 label2firstidx[lb.item()] = i
             i+=1
@@ -58,12 +59,15 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
         weakness[idx] = False # not weak means it is marked as correct
         
         #correct = torch.rand((weakness.sum(),)) < correct_prob
-        correct = ~(torch.rand((weakness.sum(),)) < 1) # make a tensor of False
-        idx = torch.randperm(correct.size(0))[:int(correct.size(0)*correct_prob)] # this will select exactly correct_prob percent to be marked as true of the weak data 
+        correct = torch.zeros((data.shape[0],)).bool() # make a tensor of False
+        idx = torch.randperm(correct.size(0))[weakness][:int(correct.size(0)*correct_prob)]
+        # this will select exactly correct_prob percent to be marked as true of the weak data
         correct[idx] = True # mark which indexes of the weakness will be marked as correct
 
-        labels[weakness][~correct] = torch.randint(0, ways, (labels[weakness][~correct].shape[0],), device=labels.device)
-        return data, labels, weakness
+        new_labels[weakness & ~correct] = torch.randint(0, ways, (new_labels[weakness & ~correct].shape[0],),
+                                                      device=labels.device)
+
+        return data, new_labels, weakness
 
     def identity_generator(data, labels):
         '''
@@ -83,7 +87,7 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
 StandardLoss = "standard"
 LowWeightLoss = "low"
 ProtoLabelLoss = "proto"
-temp = 1
+temp = 5.0
 
 def custom_loss_factory(loss_method, ways, weak_coefficient):
     '''
@@ -103,13 +107,14 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
 
         stats['nweak'] = weakness.sum()
         stats['nconf'] = labels.shape[0] - stats['nweak']
+        stats['wacc'] = torch.tensor(0.0, device=labels.device)
 
         if stats['nweak'] == 0:
-            stats['lweak'] = 0
+            stats['lweak'] = torch.tensor(0.0, device=labels.device)
             stats['lconf'] = loss(prediction, labels)
         elif stats['nconf'] == 0:
             stats['lweak'] = loss(prediction, labels)
-            stats['lconf'] = 0
+            stats['lconf'] = torch.tensor(0.0, device=labels.device)
         else:
             stats['lweak'] = loss(prediction[weakness], labels[weakness])
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
@@ -127,13 +132,14 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
 
         stats['nweak'] = weakness.sum()
         stats['nconf'] = labels.shape[0] - stats['nweak']
+        stats['wacc'] = torch.tensor(0.0, device=labels.device)
 
         if stats['nweak'] == 0:
-            stats['lweak'] = 0
+            stats['lweak'] = torch.tensor(0.0, device=labels.device)
             stats['lconf'] = loss(prediction, labels)
         elif stats['nconf'] == 0:
             stats['lweak'] = loss(prediction, labels)
-            stats['lconf'] = 0
+            stats['lconf'] = torch.tensor(0.0, device=labels.device)
         else:
             weak_labels = labels[weakness]
             # Potential experiment: Add weak label vs not adding it here; results will change as we change the
@@ -142,10 +148,10 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
             clustered_label_probs = compute_protonet_like_labels(
                 features[~weakness], features[weakness], labels[~weakness], num_classes=ways, temperature=temp)
             # Compute loss
-            stats['lweak'] = proto_loss(prediction[weakness], clustered_label_probs)
+            probabilities = torch.softmax(prediction / temp, dim=-1)
+            stats['lweak'] = proto_loss(probabilities[weakness], clustered_label_probs)
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
-            stats['wacc'] = \
-                (prediction[weakness].argmax(dim=-1) == etc['gt_labels'][weakness]).sum() * 1.0 / (labels[weakness].shape[0] * 1.0)
+            stats['wacc'] = accuracy(probabilities[weakness], etc['gt_labels'][weakness])
 
         return stats
 
@@ -257,7 +263,8 @@ def get_prototypes_from_labels(samples, labels):
     return torch.mm(M, samples)
 
 
-def compute_protonet_like_labels(support, q_latent, support_labels, num_classes, weak_query_labels=None,temperature = 1.0):
+def compute_protonet_like_labels(
+        support, q_latent, support_labels, num_classes, weak_query_labels=None, temperature=1.0):
     """
       calculates the prototype network like proposed labels using the latent representation of x
       and the latent representation of the queries
@@ -409,16 +416,16 @@ def main(args, cuda=True, seed=42):
         tq.set_postfix({
             'mt-err': meta_train_error / meta_batch_size,
             'mt-acc': meta_train_accuracy / meta_batch_size,
-            'mt-lconf': train_stats['lconf'],
-            'mt-lweak': train_stats['lweak'],
+            'mt-lconf': train_stats['avg_lconf'],
+            'mt-lweak': train_stats['avg_lweak'],
             'wacc': proto_train_acc / meta_batch_size,
             #'meta-train-f1': meta_train_f1 / meta_batch_size,
             # 'meta-train-precision': meta_train_precision / meta_batch_size,
             # 'meta-train-recall': meta_train_recall / meta_batch_size,
             'mv-err': meta_valid_error / meta_batch_size,
             'mv-acc': meta_valid_accuracy / meta_batch_size,
-            'mv-lconf': val_stats['lconf'],
-            'mv-lweak': val_stats['lweak'],
+            'mv-lconf': val_stats['avg_lconf'],
+            'mv-lweak': val_stats['avg_lweak'],
             #'meta-val-f1': meta_valid_f1 / meta_batch_size,
             #'meta-val-precision': meta_valid_precision / meta_batch_size,
             #'meta-val-recall': meta_valid_recall / meta_batch_size,
@@ -460,6 +467,10 @@ def run_unittests():
     print(pairwise_distance(B, A))
     print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=None))
     print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=labelsB))
+
+    X = torch.tensor([[0, 1, 0], [1, 0, 1], [1, 0, 1], [-1, 4, -1], [0, 0, 0]]).float()
+    labelsX = torch.tensor([[0, 1, 0, 1, 2]])
+    print(get_prototypes_from_labels(X, labelsX))
 
 
 def str2bool(s):
