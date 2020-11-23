@@ -87,7 +87,11 @@ def batch_processor_factory(labelling_method, ways, weak_prob, correct_prob=0.5)
 StandardLoss = "standard"
 LowWeightLoss = "low"
 ProtoLabelLoss = "proto"
-temp = 5.0
+temp = 0.1
+
+counter = 0
+
+import code
 
 def custom_loss_factory(loss_method, ways, weak_coefficient):
     '''
@@ -97,8 +101,9 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
     loss = nn.CrossEntropyLoss(reduction='sum')
 
     def categorical_cross_entropy(y_pred, y_true):
+        true = y_true.detach().clone()
         y_pred = torch.clamp(y_pred, 1e-9, 1 - 1e-9)
-        return -(y_true * torch.log(y_pred)).sum(dim=1).sum()
+        return -(true * torch.log(y_pred)).sum(dim=1).sum()
 
     proto_loss = categorical_cross_entropy
 
@@ -128,15 +133,21 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
             - First compute predictions based on clustering
             - Then proceed to compute standard cross entropy loss between the predictions and clustering based approach
         '''
+        global counter
+
+        counter += 1
+
         stats = {}
 
         stats['nweak'] = weakness.sum()
         stats['nconf'] = labels.shape[0] - stats['nweak']
         stats['wacc'] = torch.tensor(0.0, device=labels.device)
+        stats['cacc'] = torch.tensor(0.0, device=labels.device)
 
         if stats['nweak'] == 0:
             stats['lweak'] = torch.tensor(0.0, device=labels.device)
             stats['lconf'] = loss(prediction, labels)
+            stats['cacc'] = accuracy(prediction, labels)
         elif stats['nconf'] == 0:
             stats['lweak'] = loss(prediction, labels)
             stats['lconf'] = torch.tensor(0.0, device=labels.device)
@@ -146,12 +157,24 @@ def custom_loss_factory(loss_method, ways, weak_coefficient):
             # correct ratio in the weak labels
             features = etc['features']
             clustered_label_probs = compute_protonet_like_labels(
-                features[~weakness], features[weakness], labels[~weakness], num_classes=ways, temperature=temp)
+                features[~weakness], features[weakness], labels[~weakness], num_classes=ways, temperature=temp,
+                distance='cos')
+            # clustered_label_probs = compute_protonet_like_labels(
+            #     features[~weakness], features[~weakness], labels[~weakness], num_classes=ways, temperature=temp)
             # Compute loss
             probabilities = torch.softmax(prediction / temp, dim=-1)
-            stats['lweak'] = proto_loss(probabilities[weakness], clustered_label_probs)
+
+            # if (counter % 1000 > 995):
+            #     print(counter)
+            #     code.interact(banner="Start", local=dict(globals(), **locals()), exitmsg="End")
+
+            stats['lweak'] = proto_loss(clustered_label_probs, probabilities[weakness])
+            # stats['lweak'] *= 0
             stats['lconf'] = loss(prediction[~weakness], labels[~weakness])
-            stats['wacc'] = accuracy(probabilities[weakness], etc['gt_labels'][weakness])
+            stats['wacc'] = accuracy(prediction[weakness], etc['gt_labels'][weakness])
+            assert torch.all(torch.eq(etc['gt_labels'][~weakness], labels[~weakness]))
+            stats['cacc'] = accuracy(prediction[~weakness], labels[~weakness])
+            # stats['wacc'] = accuracy(probabilities[~weakness], etc['gt_labels'][~weakness])
 
         return stats
 
@@ -212,14 +235,28 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
 
     stats = {}
     # Adapt the model
-    for step in range(adaptation_steps):
-        logits, features = learner(adaptation_data)
-        stats = loss(
-            logits,
-            adaptation_labels,
-            adaptation_weakness,
-            {'features': features, 'gt_labels': gt_adaptation_labels})
-        learner.adapt(stats['overall_loss'])
+    # for step in range(adaptation_steps):
+    #     logits, features = learner(adaptation_data)
+    #     stats = loss(
+    #         logits,
+    #         adaptation_labels,
+    #         adaptation_weakness,
+    #         {'features': features, 'gt_labels': gt_adaptation_labels})
+    #     learner.adapt(stats['overall_loss'])
+
+    logitsInit, featuresInit = learner(adaptation_data[~adaptation_weakness])
+    stats = loss(
+        logitsInit,
+        adaptation_labels[~adaptation_weakness])
+    learner.adapt(stats['overall_loss'])
+
+    logits, features = learner(adaptation_data)
+    stats = loss(
+        logits,
+        adaptation_labels,
+        adaptation_weakness,
+        {'features': features, 'gt_labels': gt_adaptation_labels})
+    learner.adapt(stats['overall_loss'])
 
     # Evaluate the adapted model
     predictions, _ = learner(evaluation_data)
@@ -231,13 +268,15 @@ def fast_adapt(batch, batch_processor, learner, loss, adaptation_steps, shots, w
     #valid_recall = sklearn.metrics.recall_score(predictions, evaluation_labels).cpu().numpy() 
     #return valid_error, valid_accuracy, valid_f1, valid_precision
 
+    stats['cacc'] = valid_stats['cacc']
+
     # process stats to be detached cpu floats
     stats = {k: v.cpu().detach().item() for k, v in stats.items()}
 
     return valid_error, valid_accuracy, stats
 
 
-def pairwise_distance(A, B):
+def l2_distance(A, B):
     # squared norms of each row in A and B
     na = torch.sum(A * A, dim=1)
     nb = torch.sum(B * B, dim=1)
@@ -252,6 +291,12 @@ def pairwise_distance(A, B):
     return D
 
 
+def cosine_distance(A, B, eps=1e-8):
+    w1 = A.norm(p=2, dim=1, keepdim=True)
+    w2 = B.norm(p=2, dim=1, keepdim=True)
+    return -torch.mm(A, B.t()) / (w1 * w2.t()).clamp(min=eps)
+
+
 def get_prototypes_from_labels(samples, labels):
     '''
     Returns a N x D matrix where ith row represents ith class
@@ -264,7 +309,7 @@ def get_prototypes_from_labels(samples, labels):
 
 
 def compute_protonet_like_labels(
-        support, q_latent, support_labels, num_classes, weak_query_labels=None, temperature=1.0):
+        support, q_latent, support_labels, num_classes, weak_query_labels=None, temperature=1.0, distance='l2'):
     """
       calculates the prototype network like proposed labels using the latent representation of x
       and the latent representation of the queries
@@ -282,11 +327,11 @@ def compute_protonet_like_labels(
     )
 
     prototypes = get_prototypes_from_labels(support, support_labels)
-    distance = pairwise_distance(q_latent, prototypes)
+    distance_fn = l2_distance if distance == 'l2' else cosine_distance
+    distance = distance_fn(q_latent, prototypes)
 
     # Another hyperparameter which can be tuned, makes the label smoother and allows for more room for mistakes in
     # the proposal
-    #temperature = 1.0
     logits = -distance
     probabilities = torch.nn.functional.softmax(logits / temperature, dim=1)
 
@@ -371,6 +416,7 @@ def main(args, cuda=True, seed=42):
         meta_valid_error = 0.0
         meta_valid_accuracy = 0.0
         proto_train_acc = 0.0
+        cproto_train_acc = 0.0
         for task in range(meta_batch_size):
             # Compute meta-training loss
             learner = maml.clone()
@@ -404,6 +450,7 @@ def main(args, cuda=True, seed=42):
             meta_valid_error += evaluation_error.item()
             meta_valid_accuracy += evaluation_accuracy.item()
             proto_train_acc += train_stats['wacc']
+            cproto_train_acc += train_stats['cacc']
             #meta_valid_f1 += evaluation_f1.item()
             #meta_train_precision += evaluation_precision.item()
             #meta_train_recall += evaluation_recall.item()
@@ -419,6 +466,7 @@ def main(args, cuda=True, seed=42):
             'mt-lconf': train_stats['avg_lconf'],
             'mt-lweak': train_stats['avg_lweak'],
             'wacc': proto_train_acc / meta_batch_size,
+            'cacc': cproto_train_acc / meta_batch_size,
             #'meta-train-f1': meta_train_f1 / meta_batch_size,
             # 'meta-train-precision': meta_train_precision / meta_batch_size,
             # 'meta-train-recall': meta_train_recall / meta_batch_size,
@@ -462,9 +510,9 @@ def run_unittests():
     labelsA = torch.tensor([[0, 1]])
     labelsB = torch.tensor([[1, 0]])
 
-    print(pairwise_distance(A, A))
-    print(pairwise_distance(A, B))
-    print(pairwise_distance(B, A))
+    print(l2_distance(A, A))
+    print(l2_distance(A, B))
+    print(l2_distance(B, A))
     print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=None))
     print(compute_protonet_like_labels(A, B, labelsA, 2, weak_query_labels=labelsB))
 
@@ -503,8 +551,8 @@ if __name__ == '__main__':
     parser.add_argument('--meta_batch_size', default=32)
     parser.add_argument('--adaptation_steps', default=1)
     parser.add_argument('--num_iterations', type=int, default=60000)
-    parser.add_argument('--temperature', type=int, default=1)
-    parser.add_argument('--features_to_use', default='logits', type=str, help='Choose one of input, fets')
+    parser.add_argument('--temperature', type=float, default=1)
+    parser.add_argument('--features_to_use', default='fets', type=str, help='Choose one of input, fets')
 
     args = parser.parse_args()
 
